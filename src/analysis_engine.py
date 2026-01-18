@@ -26,7 +26,35 @@ def calculate_max_run(series: pd.Series) -> int:
 
 def is_date_column(df, column):
     """Check if a column contains date/datetime data"""
-    return pd.api.types.is_datetime64_any_dtype(df[column])
+    # Check if it's a datetime dtype
+    if pd.api.types.is_datetime64_any_dtype(df[column]):
+        return True
+    
+    # Check if it's in the metadata (date columns preserved as strings)
+    if hasattr(df, 'attrs') and 'date_columns' in df.attrs:
+        if column in df.attrs['date_columns']:
+            return True
+    
+    # Fallback: check if string column looks like dates
+    if df[column].dtype == 'object':
+        sample = df[column].dropna().head(10)
+        if len(sample) > 0:
+            # Check if values match common date patterns
+            sample_str = str(sample.iloc[0])
+            # Common date patterns: DD-MM-YYYY, MM-DD-YYYY, YYYY-MM-DD with optional time
+            date_patterns = ['-', '/']
+            if any(pattern in sample_str for pattern in date_patterns):
+                # Try to parse a sample
+                try:
+                    pd.to_datetime(sample, errors='coerce')
+                    parsed = pd.to_datetime(sample, errors='coerce')
+                    # If majority can be parsed as dates, consider it a date column
+                    if parsed.notna().sum() / len(sample) > 0.5:
+                        return True
+                except:
+                    pass
+    
+    return False
 
 def get_date_columns(df):
     """Get all date columns from the dataframe"""
