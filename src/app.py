@@ -248,8 +248,11 @@ def get_common_date_formats():
         "mm-dd-yy": "%m-%d-%y",
         "yy-mm-dd": "%y-%m-%d",
         "yyyy-mm-dd hh:mm:ss": "%Y-%m-%d %H:%M:%S",
+        "dd-mm-yyyy hh:mm:ss": "%d-%m-%Y %H:%M:%S",
+        "mm-dd-yyyy hh:mm:ss": "%m-%d-%Y %H:%M:%S",
         "dd/mm/yyyy hh:mm:ss": "%d/%m/%Y %H:%M:%S",
         "mm/dd/yyyy hh:mm:ss": "%m/%d/%Y %H:%M:%S",
+        "yyyy/mm/dd hh:mm:ss": "%Y/%m/%d %H:%M:%S",
         "Excel Serial Number": "excel_serial"
     }
 
