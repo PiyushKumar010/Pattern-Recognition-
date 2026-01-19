@@ -7,6 +7,10 @@ from data_processor import load_and_process_data
 from analysis_engine import analyze_data_combinations, is_date_column, get_date_columns
 from excel_handler import export_results
 from similarity_utils import add_similarity_columns
+import sys
+import os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from config import MAX_TOTAL_COMBINATIONS, calculate_max_ranges
 
 def parse_date_column(df: pd.DataFrame, column_name: str, date_format: str) -> tuple[pd.DataFrame, bool, str]:
     """
@@ -824,11 +828,14 @@ if uploaded_file:
                                 st.error("Start date must be before or equal to end date")
                                 
                         elif date_method == "Multiple Ranges":
+                            # Calculate dynamic max based on total combinations
+                            max_ranges = calculate_max_ranges(len(selected_columns))
                             num_ranges = st.number_input(
                                 f"Number of date ranges for {col}",
                                 min_value=1,
-                                max_value=20,
-                                value=3,
+                                max_value=max_ranges,
+                                value=min(3, max_ranges),
+                                help=f"Maximum {max_ranges} ranges allowed (based on total combination limit of {MAX_TOTAL_COMBINATIONS:,})",
                                 key=f"num_ranges_{col}"
                             )
                             
@@ -875,11 +882,14 @@ if uploaded_file:
                                 }
                                 
                         elif date_method == "Before Dates":
+                            # Calculate dynamic max based on total combinations
+                            max_dates = calculate_max_ranges(len(selected_columns))
                             num_dates = st.number_input(
                                 f"Number of 'before' dates for {col}",
                                 min_value=1,
-                                max_value=20,
-                                value=3,
+                                max_value=max_dates,
+                                value=min(3, max_dates),
+                                help=f"Maximum {max_dates} dates allowed (based on total combination limit of {MAX_TOTAL_COMBINATIONS:,})",
                                 key=f"num_before_dates_{col}"
                             )
                             
@@ -908,11 +918,14 @@ if uploaded_file:
                             }
                             
                         elif date_method == "After Dates":
+                            # Calculate dynamic max based on total combinations
+                            max_dates = calculate_max_ranges(len(selected_columns))
                             num_dates = st.number_input(
                                 f"Number of 'after' dates for {col}",
                                 min_value=1,
-                                max_value=20,
-                                value=3,
+                                max_value=max_dates,
+                                value=min(3, max_dates),
+                                help=f"Maximum {max_dates} dates allowed (based on total combination limit of {MAX_TOTAL_COMBINATIONS:,})",
                                 key=f"num_after_dates_{col}"
                             )
                             
@@ -941,11 +954,14 @@ if uploaded_file:
                             }
                             
                         elif date_method == "On Dates":
+                            # Calculate dynamic max based on total combinations
+                            max_dates = calculate_max_ranges(len(selected_columns))
                             num_dates = st.number_input(
                                 f"Number of specific dates for {col}",
                                 min_value=1,
-                                max_value=20,
-                                value=3,
+                                max_value=max_dates,
+                                value=min(3, max_dates),
+                                help=f"Maximum {max_dates} dates allowed (based on total combination limit of {MAX_TOTAL_COMBINATIONS:,})",
                                 key=f"num_on_dates_{col}"
                             )
                             
@@ -1094,11 +1110,14 @@ if uploaded_file:
                     elif threshold_type == "Multiple Conditions (OR Logic)":
                         st.write("**Add multiple conditions (OR logic):**")
                         
+                        # Calculate dynamic max based on total combinations
+                        max_conditions = calculate_max_ranges(len(selected_columns))
                         num_conditions = st.number_input(
                             f"Number of conditions for {col}",
                             min_value=1,
-                            max_value=20,
-                            value=2,
+                            max_value=max_conditions,
+                            value=min(2, max_conditions),
+                            help=f"Maximum {max_conditions} conditions allowed (based on total combination limit of {MAX_TOTAL_COMBINATIONS:,})",
                             key=f"num_conditions_{col}"
                         )
                         
@@ -1172,11 +1191,14 @@ if uploaded_file:
                         thresholds[col] = {"type": "multiple_conditions_or", "conditions": conditions}
                     
                     else:  # Range
+                        # Calculate dynamic max based on total combinations
+                        max_divisions = calculate_max_ranges(len(selected_columns))
                         num_divisions = st.number_input(
                             f"Number of range divisions for {col}",
                             min_value=2,
-                            max_value=20,
-                            value=5,
+                            max_value=max_divisions,
+                            value=min(5, max_divisions),
+                            help=f"Maximum {max_divisions} divisions allowed (based on total combination limit of {MAX_TOTAL_COMBINATIONS:,})",
                             key=f"range_divisions_{col}"
                         )
                         
@@ -1298,6 +1320,43 @@ if uploaded_file:
         # Step 5: Run analysis
         st.markdown('<h2 class="section-header">Execute Analysis</h2>', unsafe_allow_html=True)
         st.markdown("---")
+
+        # Calculate and display estimated total combinations
+        estimated_combinations = 1
+        combination_breakdown = []
+        for col in selected_columns:
+            if col in thresholds:
+                threshold_config = thresholds[col]
+                col_conditions = 2  # Default
+                
+                if threshold_config.get("type") == "multiple_ranges":
+                    col_conditions = len(threshold_config.get("ranges", []))
+                elif threshold_config.get("type") in ["multiple_before", "multiple_after", "multiple_on"]:
+                    col_conditions = len(threshold_config.get("dates", []))
+                elif threshold_config.get("type") in ["multiple_last_n_days", "multiple_first_n_days"]:
+                    col_conditions = len(threshold_config.get("configs", []))
+                elif threshold_config.get("type") == "multiple_conditions_or":
+                    col_conditions = len(threshold_config.get("conditions", [])) + 1  # +1 for combined OR
+                elif threshold_config.get("type") == "range":
+                    col_conditions = len(threshold_config.get("ranges", []))
+                elif threshold_config.get("type") in ["multiple_greater_than", "multiple_less_than"]:
+                    col_conditions = len(threshold_config.get("values", []))
+                
+                estimated_combinations *= col_conditions
+                combination_breakdown.append(f"{col}: {col_conditions}")
+        
+        # Display combination warning
+        if estimated_combinations > 1:
+            if estimated_combinations > MAX_TOTAL_COMBINATIONS:
+                st.error(f"⚠️ **Estimated combinations: {estimated_combinations:,}** - Exceeds limit of {MAX_TOTAL_COMBINATIONS:,}! Please reduce the number of ranges/conditions.")
+                st.info("Breakdown: " + " × ".join(combination_breakdown) + f" = {estimated_combinations:,}")
+            elif estimated_combinations > MAX_TOTAL_COMBINATIONS * 0.5:
+                st.warning(f"⚠️ **Estimated combinations: {estimated_combinations:,}** - Approaching limit of {MAX_TOTAL_COMBINATIONS:,}. Analysis may be slow.")
+                st.info("Breakdown: " + " × ".join(combination_breakdown) + f" = {estimated_combinations:,}")
+            else:
+                st.success(f"✓ **Estimated combinations: {estimated_combinations:,}** - Within safe limits")
+                with st.expander("View combination breakdown"):
+                    st.info(" × ".join(combination_breakdown) + f" = {estimated_combinations:,}")
 
         # Add this after the result columns selection and before the analyze button
         st.subheader("Analysis Settings")
