@@ -208,7 +208,7 @@ def get_column_info_from_table(table_name):
 
 def load_and_process_data(uploaded_file, save_to_db=True):
     """
-    Load the uploaded Excel file, process it, and optionally save to database.
+    Load the uploaded Excel or CSV file, process it, and optionally save to database.
     Returns both the DataFrame and the table name if saved to database.
     
     Args:
@@ -219,94 +219,127 @@ def load_and_process_data(uploaded_file, save_to_db=True):
         tuple: (df, table_name) if save_to_db=True, else (df, None)
     """
     try:
-        # Use openpyxl to read the Excel file and preserve original formatting
-        uploaded_file.seek(0)  # Reset file pointer
-        wb = load_workbook(uploaded_file, data_only=True)
-        ws = wb.active
+        # Detect file type
+        uploaded_file.seek(0)
+        filename = getattr(uploaded_file, 'name', 'uploaded_file')
+        is_csv = filename.lower().endswith('.csv')
         
-        # Track which columns are date columns (by column index)
-        date_column_indices = set()
+        if is_csv:
+            # Handle CSV files
+            uploaded_file.seek(0)
+            df = pd.read_csv(uploaded_file)
+            date_column_names = []
+            
+            print(f"After reading CSV: {len(df)} rows")
+            
+            # Convert numeric columns
+            for col in df.columns:
+                sample_values = df[col].dropna()
+                if len(sample_values) == 0:
+                    continue
+                
+                # Try to convert to numeric if possible
+                try:
+                    numeric_converted = pd.to_numeric(df[col], errors='coerce')
+                    if numeric_converted.notna().sum() > 0:
+                        non_null_count = len(df[col].dropna())
+                        if non_null_count > 0 and numeric_converted.notna().sum() / non_null_count > 0.8:
+                            df[col] = numeric_converted
+                except:
+                    pass
+            
+        else:
+            # Handle Excel files
+            uploaded_file.seek(0)  # Reset file pointer
+            wb = load_workbook(uploaded_file, data_only=True)
+            ws = wb.active
         
-        # Read data preserving original cell formats
-        data = []
-        for row_idx, row in enumerate(ws.iter_rows(values_only=False)):
-            row_data = []
-            for col_idx, cell in enumerate(row):
-                # Get the formatted value as it appears in Excel
-                if cell.value is not None:
-                    # If cell has a number format (date/time), use the displayed value
-                    if hasattr(cell, 'number_format') and cell.number_format and cell.number_format != 'General':
-                        # Try to get the formatted string value
-                        try:
-                            from openpyxl.styles.numbers import is_date_format
-                            if is_date_format(cell.number_format):
-                                # Track this column as a date column
-                                date_column_indices.add(col_idx)
-                                
-                                # For date cells, format them according to their Excel format
-                                if isinstance(cell.value, (int, float)):
-                                    # Excel serial date - convert to datetime then format
-                                    from datetime import datetime, timedelta
-                                    excel_date = datetime(1899, 12, 30) + timedelta(days=cell.value)
-                                    # Format based on number_format
-                                    if 'h' in cell.number_format.lower() or 'm' in cell.number_format.lower() or 's' in cell.number_format.lower():
-                                        # Has time component
-                                        row_data.append(excel_date.strftime('%d-%m-%Y %H:%M:%S'))
+            # Track which columns are date columns (by column index)
+            date_column_indices = set()
+            
+            # Read data preserving original cell formats
+            data = []
+            for row_idx, row in enumerate(ws.iter_rows(values_only=False)):
+                row_data = []
+                for col_idx, cell in enumerate(row):
+                    # Get the formatted value as it appears in Excel
+                    if cell.value is not None:
+                        # If cell has a number format (date/time), use the displayed value
+                        if hasattr(cell, 'number_format') and cell.number_format and cell.number_format != 'General':
+                            # Try to get the formatted string value
+                            try:
+                                from openpyxl.styles.numbers import is_date_format
+                                if is_date_format(cell.number_format):
+                                    # Track this column as a date column
+                                    date_column_indices.add(col_idx)
+                                    
+                                    # For date cells, format them according to their Excel format
+                                    if isinstance(cell.value, (int, float)):
+                                        # Excel serial date - convert to datetime then format
+                                        from datetime import datetime, timedelta
+                                        excel_date = datetime(1899, 12, 30) + timedelta(days=cell.value)
+                                        # Format based on number_format
+                                        if 'h' in cell.number_format.lower() or 'm' in cell.number_format.lower() or 's' in cell.number_format.lower():
+                                            # Has time component
+                                            row_data.append(excel_date.strftime('%d-%m-%Y %H:%M:%S'))
+                                        else:
+                                            # Date only
+                                            row_data.append(excel_date.strftime('%d-%m-%Y'))
                                     else:
-                                        # Date only
-                                        row_data.append(excel_date.strftime('%d-%m-%Y'))
+                                        # Already a datetime object
+                                        if 'h' in cell.number_format.lower() or 'm' in cell.number_format.lower() or 's' in cell.number_format.lower():
+                                            row_data.append(cell.value.strftime('%d-%m-%Y %H:%M:%S'))
+                                        else:
+                                            row_data.append(cell.value.strftime('%d-%m-%Y'))
                                 else:
-                                    # Already a datetime object
-                                    if 'h' in cell.number_format.lower() or 'm' in cell.number_format.lower() or 's' in cell.number_format.lower():
-                                        row_data.append(cell.value.strftime('%d-%m-%Y %H:%M:%S'))
-                                    else:
-                                        row_data.append(cell.value.strftime('%d-%m-%Y'))
-                            else:
+                                    row_data.append(cell.value)
+                            except:
                                 row_data.append(cell.value)
-                        except:
+                        else:
                             row_data.append(cell.value)
                     else:
-                        row_data.append(cell.value)
-                else:
-                    row_data.append(None)
-            data.append(row_data)
+                        row_data.append(None)
+                data.append(row_data)
+            
+            # Convert to DataFrame
+            df = pd.DataFrame(data[1:], columns=data[0])  # First row is header
+            
+            # Store date column names as metadata
+            date_column_names = [data[0][idx] for idx in date_column_indices if idx < len(data[0])]
         
-        # Convert to DataFrame
-        df = pd.DataFrame(data[1:], columns=data[0])  # First row is header
-        
-        # Store date column names as metadata
-        date_column_names = [data[0][idx] for idx in date_column_indices if idx < len(data[0])]
+        # Common processing for both CSV and Excel
         df.attrs['date_columns'] = date_column_names
         
-        print(f"After reading Excel: {len(df)} rows")
+        print(f"After reading file: {len(df)} rows")
         print(f"Detected date columns: {date_column_names}")
         
         empty_rows = df.isnull().all(axis=1).sum()
         print(f"Completely empty rows found: {empty_rows}")
         
-        # Convert pure numeric columns to numeric types (excluding date columns which are now strings)
-        for col in df.columns:
-            # Skip if column is empty
-            sample_values = df[col].dropna()
-            if len(sample_values) == 0:
-                continue
-            
-            # Skip columns that look like dates (already preserved as strings)
-            sample_str = str(sample_values.iloc[0]) if len(sample_values) > 0 else ""
-            if '-' in sample_str or '/' in sample_str or ':' in sample_str:
-                continue
-            
-            # Try to convert to numeric if possible (for pure numeric columns)
-            try:
-                numeric_converted = pd.to_numeric(df[col], errors='coerce')
-                # Only convert if at least some values are actually numeric
-                if numeric_converted.notna().sum() > 0:
-                    # Check if conversion makes sense (not all NaN after conversion)
-                    non_null_count = len(df[col].dropna())
-                    if non_null_count > 0 and numeric_converted.notna().sum() / non_null_count > 0.8:
-                        df[col] = numeric_converted
-            except:
-                pass  # Keep as string if conversion fails
+        # Convert pure numeric columns to numeric types (only for Excel files)
+        if not is_csv:
+            for col in df.columns:
+                # Skip if column is empty
+                sample_values = df[col].dropna()
+                if len(sample_values) == 0:
+                    continue
+                
+                # Skip columns that look like dates (already preserved as strings)
+                sample_str = str(sample_values.iloc[0]) if len(sample_values) > 0 else ""
+                if '-' in sample_str or '/' in sample_str or ':' in sample_str:
+                    continue
+                
+                # Try to convert to numeric if possible (for pure numeric columns)
+                try:
+                    numeric_converted = pd.to_numeric(df[col], errors='coerce')
+                    # Only convert if at least some values are actually numeric
+                    if numeric_converted.notna().sum() > 0:
+                        # Check if conversion makes sense (not all NaN after conversion)
+                        non_null_count = len(df[col].dropna())
+                        if non_null_count > 0 and numeric_converted.notna().sum() / non_null_count > 0.8:
+                            df[col] = numeric_converted
+                except:
+                    pass  # Keep as string if conversion fails
         
         # Save to database if requested
         table_name = None
@@ -355,4 +388,4 @@ def load_and_process_data(uploaded_file, save_to_db=True):
         return df, table_name
         
     except Exception as e:
-        raise Exception(f"Error loading Excel file: {str(e)}")
+        raise Exception(f"Error loading file: {str(e)}")

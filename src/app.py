@@ -483,12 +483,12 @@ if st.session_state.get('show_history', False):
     
     with st.expander("View Previous Analyses", expanded=True):
         try:
-            from src.history_manager import get_analysis_history, get_analysis_by_id, delete_analysis, get_history_stats
+            from src.history_manager import get_analysis_history, get_analysis_by_id, delete_analysis, get_history_stats, clear_all_history
             
-            # Show stats
+            # Show stats and clear all button
+            col1, col2, col3, col4 = st.columns([2, 2, 2, 2])
             stats = get_history_stats()
             if stats:
-                col1, col2, col3 = st.columns(3)
                 with col1:
                     st.metric("Total Analyses", stats.get('total_analyses', 0))
                 with col2:
@@ -497,6 +497,16 @@ if st.session_state.get('show_history', False):
                     avg_time = stats.get('avg_execution_time_ms', 0)
                     if avg_time:
                         st.metric("Avg Time", f"{int(avg_time)}ms")
+                with col4:
+                    if stats.get('total_analyses', 0) > 0:
+                        if st.button("🗑️ Clear All", type="secondary", use_container_width=True, help="Delete all history"):
+                            if clear_all_history():
+                                st.success("✅ All history cleared!")
+                                st.rerun()
+                            else:
+                                st.error("❌ Failed to clear history")
+            
+            st.divider()
             
             # Get history
             history = get_analysis_history(limit=20)
@@ -504,7 +514,7 @@ if st.session_state.get('show_history', False):
             if history:
                 for record in history:
                     with st.container():
-                        col1, col2, col3, col4 = st.columns([3, 2, 2, 1])
+                        col1, col2, col3, col4, col5 = st.columns([3, 2, 2, 1, 1])
                         
                         with col1:
                             st.write(f"**{record['original_filename']}**")
@@ -538,6 +548,14 @@ if st.session_state.get('show_history', False):
                                 st.session_state.show_history = False
                                 st.rerun()
                         
+                        with col5:
+                            if st.button("🗑️", key=f"delete_{record['id']}", help="Delete this record"):
+                                if delete_analysis(record['id']):
+                                    st.success("✅ Deleted!")
+                                    st.rerun()
+                                else:
+                                    st.error("❌ Failed to delete")
+                        
                         st.divider()
             else:
                 st.info("No analysis history yet. Run your first analysis to see it here!")
@@ -569,6 +587,10 @@ if st.session_state.get('restore_analysis_id'):
             df = fetch_dataframe_from_db(f'SELECT * FROM "{analysis["table_name"]}"')
             
             if df is not None and not df.empty:
+                # Initialize session state if needed
+                if 'date_columns_config' not in st.session_state:
+                    st.session_state.date_columns_config = {}
+                
                 # Restore session state
                 st.session_state.parsed_df = df.copy()
                 st.session_state.original_df = df.copy()
@@ -581,9 +603,10 @@ if st.session_state.get('restore_analysis_id'):
                 
                 # Store restored config in session
                 st.session_state.restored_config = config
+                st.session_state.data_source = 'restored'  # Mark as restored
                 
                 st.success(f"✅ Restored analysis for '{analysis['original_filename']}'")
-                st.info("Configuration has been restored. Scroll down to review and re-run the analysis.")
+                st.info("📊 Dataset and configuration loaded. Scroll down to review and re-run the analysis.")
             else:
                 st.error("Failed to load dataset. The data may have been deleted.")
         
@@ -593,7 +616,8 @@ if st.session_state.get('restore_analysis_id'):
         st.error(f"Error restoring analysis: {e}")
         st.session_state.restore_analysis_id = None
 
-if uploaded_file:
+# Check if we have data (either from upload or restore)
+if uploaded_file or st.session_state.get('parsed_df') is not None:
     # Initialize session state for date parsing and database
     if 'parsed_df' not in st.session_state:
         st.session_state.parsed_df = None
@@ -601,9 +625,20 @@ if uploaded_file:
         st.session_state.date_columns_config = {}
     if 'table_name' not in st.session_state:
         st.session_state.table_name = None
+    if 'last_uploaded_file_id' not in st.session_state:
+        st.session_state.last_uploaded_file_id = None
     
-    # Load initial data and save to database
-    if st.session_state.parsed_df is None:
+    # Get current file ID (name + size) to detect new uploads
+    current_file_id = None
+    if uploaded_file:
+        current_file_id = f"{uploaded_file.name}_{uploaded_file.size}"
+    
+    # Load initial data and save to database (only if new upload)
+    if uploaded_file and st.session_state.get('data_source') != 'restored' and current_file_id != st.session_state.last_uploaded_file_id:
+        # Clear restored data source flag if new upload
+        if 'data_source' in st.session_state:
+            del st.session_state.data_source
+        
         with st.spinner("🚀 Uploading data using optimized method..."):
             progress_bar = st.progress(0)
             status_text = st.empty()
@@ -619,6 +654,7 @@ if uploaded_file:
             st.session_state.original_df = df.copy()
             st.session_state.parsed_df = df.copy()
             st.session_state.table_name = table_name
+            st.session_state.last_uploaded_file_id = current_file_id
             
             progress_bar.progress(100)
             status_text.empty()
@@ -627,11 +663,27 @@ if uploaded_file:
             if table_name:
                 st.success(f"✅ Data uploaded successfully! {len(df):,} rows loaded to table: `{table_name}`")
                 st.info(f"⚡ Upload completed using PostgreSQL COPY (optimized for large files)")
-    else:
-        df = st.session_state.parsed_df.copy()
-        table_name = st.session_state.table_name
     
-    st.success(f"Successfully loaded {len(df)} rows and {len(df.columns)} columns")
+    # Use data from session state (works for both upload and restore)
+    df = st.session_state.parsed_df.copy()
+    table_name = st.session_state.table_name
+    
+    if df is not None and not df.empty:
+        col1, col2 = st.columns([5, 1])
+        with col1:
+            st.success(f"Successfully loaded {len(df)} rows and {len(df.columns)} columns")
+        with col2:
+            if st.button("🔄 Clear Data", help="Clear current data to upload a new file"):
+                # Clear all session state related to data
+                st.session_state.parsed_df = None
+                st.session_state.original_df = None
+                st.session_state.table_name = None
+                st.session_state.date_columns_config = {}
+                if 'restored_config' in st.session_state:
+                    del st.session_state.restored_config
+                if 'data_source' in st.session_state:
+                    del st.session_state.data_source
+                st.rerun()
     
     # Date Column Configuration
     st.markdown('<h2 class="section-header">Date Column Configuration</h2>', unsafe_allow_html=True)

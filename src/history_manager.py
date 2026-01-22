@@ -275,6 +275,22 @@ def delete_analysis(analysis_id: int) -> bool:
         return False
 
 
+def clear_all_history() -> bool:
+    """
+    Delete all analysis history records.
+    
+    Returns:
+        True if successful, False otherwise
+    """
+    try:
+        with get_db_cursor() as cursor:
+            cursor.execute("DELETE FROM analysis_history")
+            return True
+    except Exception as e:
+        print(f"Error clearing history: {e}")
+        return False
+
+
 def get_history_stats() -> Dict:
     """
     Get statistics about analysis history.
