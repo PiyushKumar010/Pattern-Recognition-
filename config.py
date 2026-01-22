@@ -1,4 +1,10 @@
 # filepath: /data-analysis-tool/data-analysis-tool/config.py
+import os
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
+
 DEFAULT_THRESHOLD = 0.0
 SUPPORTED_FILE_TYPES = ['xlsx', 'xls']
 ANALYSIS_OPTIONS = ['mean', 'median', 'mode']
@@ -9,6 +15,22 @@ MAX_ROWS_DISPLAY = 200
 # This is the product of all condition variations across all selected columns
 # Set to 10,000 for optimal performance - analysis completes in < 30 seconds
 MAX_TOTAL_COMBINATIONS = 10000
+
+# PostgreSQL Configuration - Using environment variables for security
+POSTGRESQL_CONFIG = {
+    'host': os.getenv('POSTGRES_HOST', 'localhost'),
+    'port': int(os.getenv('POSTGRES_PORT', '5432')),
+    'database': os.getenv('POSTGRES_DB', 'Pattern'),
+    'user': os.getenv('POSTGRES_USER', 'postgres'),
+    'password': os.getenv('POSTGRES_PASSWORD', ''),
+    # Connection pool settings for performance
+    'minconn': int(os.getenv('POSTGRES_MIN_CONN', '1')),
+    'maxconn': int(os.getenv('POSTGRES_MAX_CONN', '10')),
+    # Connection timeout in seconds
+    'connect_timeout': int(os.getenv('POSTGRES_CONNECT_TIMEOUT', '10')),
+    # Application name for monitoring
+    'application_name': os.getenv('POSTGRES_APP_NAME', 'PNC_Conditional_Processor')
+}
 
 def calculate_max_ranges(selected_columns_count: int, current_column_ranges: dict = None) -> int:
     """

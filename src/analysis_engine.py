@@ -2,6 +2,193 @@ import pandas as pd
 import numpy as np
 from itertools import combinations, product
 from datetime import datetime
+from src.data_processor import fetch_dataframe_from_db
+from src.filter_manager import generate_sql_condition
+
+
+def analyze_data_combinations_db(table_name, selected_columns, thresholds, id_column, result_columns, 
+                                  column_types, min_matching_rows=10):
+    """
+    Database-driven version: Analyze data combinations using SQL queries for better performance.
+    Fetches data from PostgreSQL instead of working on pandas DataFrames.
+    
+    Args:
+        table_name (str): Name of the database table containing the data
+        selected_columns (list): Columns to analyze
+        thresholds (dict): Threshold configurations
+        id_column (str): ID column name
+        result_columns (list): Columns to calculate statistics for
+        column_types (dict): Column data types {'column_name': 'numeric'/'date'/'categorical'}
+        min_matching_rows (int): Minimum number of rows required for a combination
+    
+    Returns:
+        pd.DataFrame: Analysis results
+    """
+    results = []
+    
+    # Generate all combination lengths
+    for combo_length in range(1, len(selected_columns) + 1):
+        # Get all combinations of columns for this length
+        for column_combo in combinations(selected_columns, combo_length):
+            
+            # For each combination, generate all condition variations
+            condition_variations = []
+            for col in column_combo:
+                threshold_config = thresholds[col]
+                col_type = column_types.get(col, 'numeric')
+                
+                # Generate SQL conditions for this column
+                sql_conditions = generate_sql_condition(col, threshold_config, col_type)
+                
+                # Store as tuples with metadata for later use
+                condition_tuples = []
+                for sql_cond in sql_conditions:
+                    condition_tuples.append((col, sql_cond, threshold_config, col_type))
+                
+                condition_variations.append(condition_tuples)
+            
+            # Generate all products of condition variations
+            for condition_set in product(*condition_variations):
+                # Build SQL query for this combination
+                where_clauses = []
+                applied_conditions = {}
+                
+                # Initialize all selected columns as blank
+                for col in selected_columns:
+                    applied_conditions[col] = ""
+                
+                # Build WHERE clause
+                for col, sql_cond, threshold_cfg, col_type in condition_set:
+                    where_clauses.append(f"({sql_cond})")
+                    applied_conditions[col] = generate_condition_description(col, sql_cond, threshold_cfg, col_type)
+                
+                # Combine WHERE clauses
+                where_clause = " AND ".join(where_clauses) if where_clauses else "1=1"
+                
+                # Build aggregation SQL query
+                agg_parts = [f"COUNT(*) as matching_rows"]
+                
+                for result_col in result_columns:
+                    agg_parts.extend([
+                        f"AVG(\"{result_col}\") as {result_col}_mean",
+                        f"SUM(\"{result_col}\") as {result_col}_sum",
+                        f"COUNT(\"{result_col}\") as {result_col}_count",
+                        f"STDDEV(\"{result_col}\") as {result_col}_stddev",
+                        f"PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY \"{result_col}\") as {result_col}_median",
+                        f"MIN(\"{result_col}\") as {result_col}_min",
+                        f"MAX(\"{result_col}\") as {result_col}_max"
+                    ])
+                
+                # Build and execute aggregation query
+                agg_query = f"""
+                    SELECT {', '.join(agg_parts)}
+                    FROM {table_name}
+                    WHERE {where_clause}
+                """
+                
+                try:
+                    agg_df = fetch_dataframe_from_db(agg_query)
+                    
+                    if agg_df is not None and not agg_df.empty:
+                        matching_rows = int(agg_df.iloc[0]['matching_rows'])
+                        
+                        # Skip if below minimum threshold
+                        if matching_rows < min_matching_rows:
+                            continue
+                        
+                        # Create result row
+                        result_row = applied_conditions.copy()
+                        result_row['Matching_Rows'] = matching_rows
+                        
+                        # Add aggregated statistics
+                        for col in agg_df.columns:
+                            if col != 'matching_rows':
+                                val = agg_df.iloc[0][col]
+                                if pd.notna(val):
+                                    result_row[col.title().replace('_', ' ')] = round(float(val), 4) if isinstance(val, (int, float)) else val
+                        
+                        # Fetch sample IDs (limited to first 20)
+                        id_query = f"""
+                            SELECT \"{id_column}\"
+                            FROM {table_name}
+                            WHERE {where_clause}
+                            LIMIT 20
+                        """
+                        
+                        id_df = fetch_dataframe_from_db(id_query)
+                        if id_df is not None and not id_df.empty:
+                            ids = id_df[id_column].astype(str).tolist()
+                            if matching_rows > 20:
+                                result_row['IDs'] = ', '.join(ids) + f" ... ({matching_rows - 20} more)"
+                            else:
+                                result_row['IDs'] = ', '.join(ids)
+                        
+                        results.append(result_row)
+                        
+                except Exception as e:
+                    print(f"Error executing query: {e}")
+                    print(f"Query: {agg_query}")
+                    continue
+    
+    return pd.DataFrame(results)
+
+
+def generate_condition_description(column, sql_condition, threshold_config, col_type):
+    """
+    Generate human-readable description from SQL condition.
+    
+    Args:
+        column (str): Column name
+        sql_condition (str): SQL condition string
+        threshold_config (dict): Original threshold configuration
+        col_type (str): Column type
+    
+    Returns:
+        str: Human-readable description
+    """
+    # Extract key information from SQL condition or use threshold config
+    if col_type == 'date':
+        if 'BETWEEN' in sql_condition:
+            parts = sql_condition.split("BETWEEN")[1].split("AND")
+            if len(parts) == 2:
+                start = parts[0].strip().strip("'")
+                end = parts[1].strip().strip("'")
+                return f"{column}: {start} to {end}"
+        elif '<' in sql_condition and '::date' in sql_condition:
+            date = sql_condition.split("'")[1]
+            return f"{column} before {date}"
+        elif '>' in sql_condition and '::date' in sql_condition:
+            date = sql_condition.split("'")[1]
+            return f"{column} after {date}"
+        elif '=' in sql_condition and '::date' in sql_condition:
+            date = sql_condition.split("'")[1]
+            return f"{column} on {date}"
+            
+    elif col_type == 'numeric':
+        if 'OR' in sql_condition:
+            return f"{column}: {sql_condition}"
+        elif '>=' in sql_condition and '<' in sql_condition:
+            # Range condition
+            parts = sql_condition.split('AND')
+            return f"{column}: {' and '.join(parts)}"
+        elif '>=' in sql_condition:
+            val = sql_condition.split('>=')[1].strip()
+            return f"{column} >= {val}"
+        elif '<' in sql_condition:
+            val = sql_condition.split('<')[1].strip()
+            return f"{column} < {val}"
+        elif '>' in sql_condition:
+            val = sql_condition.split('>')[1].strip()
+            return f"{column} > {val}"
+            
+    elif col_type == 'categorical':
+        if 'IN' in sql_condition:
+            values = sql_condition.split('IN')[1].strip().strip('()').replace("'", "")
+            return f"{column} in [{values}]"
+    
+    # Fallback
+    return sql_condition
+
 
 def calculate_max_run(series: pd.Series) -> int:
     """
@@ -26,8 +213,23 @@ def calculate_max_run(series: pd.Series) -> int:
 
 def is_date_column(df, column):
     """Check if a column contains date/datetime data"""
+    # Ensure column is a string, not a list or other type
+    if not isinstance(column, str):
+        return False
+    
+    # Check if column exists
+    if column not in df.columns:
+        return False
+    
+    # Get the column - ensure we get a Series, not a DataFrame
+    col_data = df[column]
+    
+    # If we got a DataFrame instead of Series (duplicate column names), return False
+    if isinstance(col_data, pd.DataFrame):
+        return False
+    
     # Check if it's a datetime dtype
-    if pd.api.types.is_datetime64_any_dtype(df[column]):
+    if pd.api.types.is_datetime64_any_dtype(col_data):
         return True
     
     # Check if it's in the metadata (date columns preserved as strings)
@@ -36,8 +238,8 @@ def is_date_column(df, column):
             return True
     
     # Fallback: check if string column looks like dates
-    if df[column].dtype == 'object':
-        sample = df[column].dropna().head(10)
+    if col_data.dtype == 'object':
+        sample = col_data.dropna().head(10)
         if len(sample) > 0:
             # Check if values match common date patterns
             sample_str = str(sample.iloc[0])

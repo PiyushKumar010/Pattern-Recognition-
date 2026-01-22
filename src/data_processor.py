@@ -1,10 +1,222 @@
 import pandas as pd
 from openpyxl import load_workbook
+import hashlib
+from datetime import datetime
 
-def load_and_process_data(uploaded_file):
+# PostgreSQL connection utilities
+from src.utils.db import get_db_cursor, get_db_connection, execute_query
+
+def fetch_data_from_db(query, params=None):
     """
-    Load the uploaded Excel file preserving original date formats as strings.
-    This prevents automatic date parsing and allows user to control date parsing explicitly.
+    Fetch data from PostgreSQL database with proper connection management.
+    
+    Args:
+        query (str): SQL query to execute (use %s for parameters)
+        params (tuple/dict): Query parameters for safe parameterized queries
+    
+    Returns:
+        list of tuples: Query results
+        
+    Example:
+        # Simple query
+        results = fetch_data_from_db("SELECT * FROM users WHERE active = %s", (True,))
+        
+        # Query with multiple parameters
+        results = fetch_data_from_db(
+            "SELECT * FROM orders WHERE user_id = %s AND date > %s",
+            (user_id, start_date)
+        )
+    """
+    try:
+        return execute_query(query, params, fetch=True)
+    except Exception as e:
+        print(f"Database query error: {e}")
+        return None
+
+
+def fetch_dataframe_from_db(query, params=None):
+    """
+    Fetch data from PostgreSQL and return as pandas DataFrame.
+    
+    Args:
+        query (str): SQL query to execute
+        params (tuple/dict): Query parameters
+    
+    Returns:
+        pd.DataFrame: Query results as DataFrame
+    """
+    try:
+        with get_db_connection() as conn:
+            df = pd.read_sql_query(query, conn, params=params)
+        return df
+    except Exception as e:
+        print(f"Database DataFrame query error: {e}")
+        return None
+
+
+def save_dataframe_to_db(df, table_name, if_exists='replace', index=False):
+    """
+    Save pandas DataFrame to PostgreSQL table using the FASTEST method.
+    Uses PostgreSQL COPY command for maximum performance (10-50x faster than INSERT).
+    
+    Args:
+        df (pd.DataFrame): DataFrame to save
+        table_name (str): Name of the database table
+        if_exists (str): 'fail', 'replace', or 'append' (default: 'replace')
+        index (bool): Write DataFrame index as a column
+    
+    Returns:
+        tuple: (success: bool, message: str)
+    """
+    try:
+        from sqlalchemy import create_engine, text
+        from io import StringIO
+        import sys
+        import os
+        sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+        from config import POSTGRESQL_CONFIG
+        
+        print(f"Starting optimized upload for {len(df)} rows...")
+        
+        # Create SQLAlchemy engine
+        connection_string = f"postgresql://{POSTGRESQL_CONFIG['user']}:{POSTGRESQL_CONFIG['password']}@{POSTGRESQL_CONFIG['host']}:{POSTGRESQL_CONFIG['port']}/{POSTGRESQL_CONFIG['database']}"
+        engine = create_engine(connection_string)
+        
+        # Handle if_exists parameter
+        with engine.connect() as connection:
+            if if_exists == 'replace':
+                # Drop table if exists
+                connection.execute(text(f'DROP TABLE IF EXISTS "{table_name}"'))
+                connection.commit()
+                print("Dropped existing table (if any)")
+            elif if_exists == 'fail':
+                # Check if table exists
+                result = connection.execute(text(
+                    "SELECT EXISTS (SELECT FROM pg_tables WHERE tablename = :table_name)"
+                ), {"table_name": table_name})
+                if result.fetchone()[0]:
+                    raise ValueError(f"Table '{table_name}' already exists")
+        
+        # Create table structure using to_sql with 0 rows (fast)
+        print("Creating table structure...")
+        df.head(0).to_sql(table_name, engine, if_exists='append', index=index)
+        
+        # Now use PostgreSQL COPY for bulk insert (FAST!)
+        print(f"Bulk loading {len(df)} rows using PostgreSQL COPY command...")
+        
+        # Get raw psycopg2 connection
+        from src.utils.db import get_postgres_connection, return_connection
+        conn = get_postgres_connection()
+        
+        try:
+            # Convert DataFrame to CSV in memory
+            csv_buffer = StringIO()
+            df.to_csv(csv_buffer, index=index, header=False, sep='\t', na_rep='\\N')
+            csv_buffer.seek(0)
+            
+            # Use COPY command (PostgreSQL's fastest bulk loader)
+            cursor = conn.cursor()
+            
+            # Build column list
+            columns = ', '.join([f'"{col}"' for col in df.columns])
+            
+            copy_sql = f'COPY "{table_name}" ({columns}) FROM STDIN WITH (FORMAT CSV, DELIMITER E\'\\t\', NULL \'\\N\')'
+            cursor.copy_expert(copy_sql, csv_buffer)
+            
+            conn.commit()
+            cursor.close()
+            
+            message = f"✅ Successfully uploaded {len(df):,} rows to table '{table_name}' using optimized COPY method"
+            print(message)
+            
+            return True, message
+            
+        finally:
+            return_connection(conn)
+        
+    except Exception as e:
+        error_msg = f"Error saving DataFrame to database: {e}"
+        print(error_msg)
+        
+        # Fallback to slower method if COPY fails
+        print("Falling back to standard method...")
+        try:
+            from sqlalchemy import create_engine
+            connection_string = f"postgresql://{POSTGRESQL_CONFIG['user']}:{POSTGRESQL_CONFIG['password']}@{POSTGRESQL_CONFIG['host']}:{POSTGRESQL_CONFIG['port']}/{POSTGRESQL_CONFIG['database']}"
+            engine = create_engine(connection_string)
+            
+            df.to_sql(table_name, engine, if_exists=if_exists, index=index, method='multi', chunksize=5000)
+            message = f"Successfully saved {len(df)} rows using fallback method"
+            print(message)
+            return True, message
+        except Exception as fallback_error:
+            return False, f"Both methods failed: {str(fallback_error)}"
+
+
+def get_table_name_from_file(filename):
+    """
+    Generate a unique table name from uploaded file name.
+    Uses hash to ensure uniqueness and avoid SQL injection.
+    
+    Args:
+        filename (str): Original filename
+    
+    Returns:
+        str: Safe table name
+    """
+    # Create hash of filename with timestamp for uniqueness
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    hash_obj = hashlib.md5(f"{filename}_{timestamp}".encode())
+    hash_str = hash_obj.hexdigest()[:8]
+    
+    # Clean filename to create base name
+    base_name = filename.replace('.xlsx', '').replace('.xls', '').replace(' ', '_').replace('-', '_')
+    # Remove special characters
+    base_name = ''.join(c for c in base_name if c.isalnum() or c == '_')
+    base_name = base_name[:20]  # Limit length
+    
+    return f"upload_{base_name}_{hash_str}".lower()
+
+
+def get_column_info_from_table(table_name):
+    """
+    Get column information from a database table.
+    
+    Args:
+        table_name (str): Name of the table
+    
+    Returns:
+        dict: Column information with types
+    """
+    try:
+        query = """
+            SELECT column_name, data_type 
+            FROM information_schema.columns 
+            WHERE table_name = %s
+            ORDER BY ordinal_position
+        """
+        results = execute_query(query, (table_name,), fetch=True)
+        
+        column_info = {}
+        for col_name, data_type in results:
+            column_info[col_name] = data_type
+        
+        return column_info
+    except Exception as e:
+        print(f"Error getting column info: {e}")
+        return {}
+
+def load_and_process_data(uploaded_file, save_to_db=True):
+    """
+    Load the uploaded Excel file, process it, and optionally save to database.
+    Returns both the DataFrame and the table name if saved to database.
+    
+    Args:
+        uploaded_file: Uploaded file object
+        save_to_db (bool): Whether to save data to PostgreSQL database
+    
+    Returns:
+        tuple: (df, table_name) if save_to_db=True, else (df, None)
     """
     try:
         # Use openpyxl to read the Excel file and preserve original formatting
@@ -96,7 +308,51 @@ def load_and_process_data(uploaded_file):
             except:
                 pass  # Keep as string if conversion fails
         
-        return df
+        # Save to database if requested
+        table_name = None
+        dataset_id = None
+        if save_to_db:
+            # Generate unique table name
+            filename = getattr(uploaded_file, 'name', 'uploaded_file')
+            table_name = get_table_name_from_file(filename)
+            
+            # Save DataFrame to database
+            success, message = save_dataframe_to_db(df, table_name, if_exists='replace')
+            if success:
+                print(f"Data saved to database table: {table_name}")
+                
+                # Save dataset metadata to history system
+                try:
+                    from src.history_manager import save_dataset, generate_file_hash
+                    
+                    # Get file content for hash
+                    uploaded_file.seek(0)
+                    file_content = uploaded_file.read()
+                    file_hash = generate_file_hash(file_content)
+                    file_size = len(file_content)
+                    uploaded_file.seek(0)  # Reset for potential reuse
+                    
+                    dataset_id = save_dataset(
+                        original_filename=filename,
+                        table_name=table_name,
+                        file_hash=file_hash,
+                        file_size_bytes=file_size,
+                        rows_count=len(df),
+                        columns_count=len(df.columns)
+                    )
+                    if dataset_id:
+                        print(f"Dataset metadata saved with ID: {dataset_id}")
+                except Exception as e:
+                    print(f"Warning: Failed to save dataset metadata: {e}")
+            else:
+                print(f"Warning: Failed to save to database: {message}")
+                table_name = None
+        
+        # Store dataset_id in df attributes for later use
+        if dataset_id:
+            df.attrs['dataset_id'] = dataset_id
+        
+        return df, table_name
         
     except Exception as e:
         raise Exception(f"Error loading Excel file: {str(e)}")

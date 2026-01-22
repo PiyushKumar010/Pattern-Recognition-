@@ -12,6 +12,18 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config import MAX_TOTAL_COMBINATIONS, calculate_max_ranges
 
+# Initialize database connection pool at startup
+from src.utils.db import initialize_connection_pool, close_connection_pool, test_connection
+import atexit
+
+# Initialize connection pool when app starts
+try:
+    initialize_connection_pool()
+    # Register cleanup function to close pool on shutdown
+    atexit.register(close_connection_pool)
+except Exception as e:
+    st.warning(f"Database connection pool initialization failed: {e}. Database features will be unavailable.")
+
 def parse_date_column(df: pd.DataFrame, column_name: str, date_format: str) -> tuple[pd.DataFrame, bool, str]:
     """
     Parse a date column with the specified format and convert to datetime.
@@ -140,21 +152,47 @@ def parse_date_column_multi_format(df: pd.DataFrame, column_name: str, date_form
         if successfully_parsed == 0:
             return df, False, "All values failed to parse with all attempted formats."
         
+        # Validate parsed dates - check for meaningless results
+        valid_parsed = parsed_values.dropna()
+        if len(valid_parsed) > 0:
+            # Check if all/most dates are the same (likely bad parsing)
+            unique_dates = valid_parsed.nunique()
+            if unique_dates == 1:
+                return df, False, f"All parsed values resulted in the same date ({valid_parsed.iloc[0]}). This column likely does not contain dates."
+            
+            # Check if most dates are 1970-01-01 (Unix epoch - indicates numeric values being misinterpreted)
+            epoch_date = pd.Timestamp('1970-01-01')
+            epoch_count = (valid_parsed == epoch_date).sum()
+            if epoch_count / len(valid_parsed) > 0.5:
+                return df, False, f"Most parsed dates are 1970-01-01 (Unix epoch). This column contains numeric values, not dates."
+        
         # Generate detailed message
         success_rate = (successfully_parsed / (total_count - original_na_count)) * 100 if (total_count - original_na_count) > 0 else 0
         
         message_parts = [f"Successfully parsed {successfully_parsed}/{total_count - original_na_count} values ({success_rate:.1f}% success rate)"]
         
+        # Add warning if success rate is low
+        if success_rate < 50:
+            message_parts.append("\n⚠️ WARNING: Less than 50% of values were successfully parsed.")
+            message_parts.append("This column may not contain valid dates. Please verify the results.")
+        elif success_rate < 80:
+            message_parts.append("\n⚠️ CAUTION: Only {:.1f}% of values were successfully parsed.".format(success_rate))
+            message_parts.append("Some values may not be valid dates. Review the results carefully.")
+        
         # Add format breakdown
         successful_formats = {fmt: count for fmt, count in format_success_counts.items() if count > 0}
         if successful_formats:
-            message_parts.append("Format breakdown:")
+            message_parts.append("\nFormat breakdown:")
             for fmt, count in successful_formats.items():
                 format_name = fmt if fmt in ["auto", "excel_serial"] else f"Custom: {fmt}"
                 message_parts.append(f"  - {format_name}: {count} values")
         
         if parsing_failures > 0:
-            message_parts.append(f"{parsing_failures} values failed to parse")
+            message_parts.append(f"\n{parsing_failures} values failed to parse")
+        
+        # Consider parsing as failed if success rate is too low
+        if success_rate < 50:
+            return df_copy, False, "\n".join(message_parts)
             
         return df_copy, True, "\n".join(message_parts)
         
@@ -433,24 +471,165 @@ st.markdown("""
 
 st.markdown('<h1 class="main-header">Data Analysis Tool</h1>', unsafe_allow_html=True)
 
+# History button in the header
+col1, col2 = st.columns([6, 1])
+with col2:
+    if st.button("📜 History", use_container_width=True):
+        st.session_state.show_history = not st.session_state.get('show_history', False)
+
+# Show history panel if toggled
+if st.session_state.get('show_history', False):
+    st.markdown('<h2 class="section-header">Analysis History</h2>', unsafe_allow_html=True)
+    
+    with st.expander("View Previous Analyses", expanded=True):
+        try:
+            from src.history_manager import get_analysis_history, get_analysis_by_id, delete_analysis, get_history_stats
+            
+            # Show stats
+            stats = get_history_stats()
+            if stats:
+                col1, col2, col3 = st.columns(3)
+                with col1:
+                    st.metric("Total Analyses", stats.get('total_analyses', 0))
+                with col2:
+                    st.metric("Datasets Used", stats.get('total_datasets', 0))
+                with col3:
+                    avg_time = stats.get('avg_execution_time_ms', 0)
+                    if avg_time:
+                        st.metric("Avg Time", f"{int(avg_time)}ms")
+            
+            # Get history
+            history = get_analysis_history(limit=20)
+            
+            if history:
+                for record in history:
+                    with st.container():
+                        col1, col2, col3, col4 = st.columns([3, 2, 2, 1])
+                        
+                        with col1:
+                            st.write(f"**{record['original_filename']}**")
+                            config = record.get('config_json', {})
+                            if isinstance(config, str):
+                                import json
+                                config = json.loads(config)
+                            selected_cols = config.get('selected_columns', [])
+                            st.caption(f"Columns: {', '.join(selected_cols[:3])}{'...' if len(selected_cols) > 3 else ''}")
+                        
+                        with col2:
+                            created = record.get('created_at')
+                            if created:
+                                st.write(f"🕒 {created.strftime('%Y-%m-%d %H:%M')}")
+                        
+                        with col3:
+                            status = record.get('status', 'unknown')
+                            if status == 'completed':
+                                result_count = record.get('result_row_count', 0)
+                                exec_time = record.get('execution_time_ms', 0)
+                                st.success(f"✅ {result_count} results ({exec_time}ms)")
+                            elif status == 'failed':
+                                st.error("❌ Failed")
+                            else:
+                                st.info("⏳ Pending")
+                        
+                        with col4:
+                            if st.button("🔄", key=f"restore_{record['id']}", help="Restore this analysis"):
+                                # Load the analysis config
+                                st.session_state.restore_analysis_id = record['id']
+                                st.session_state.show_history = False
+                                st.rerun()
+                        
+                        st.divider()
+            else:
+                st.info("No analysis history yet. Run your first analysis to see it here!")
+        
+        except Exception as e:
+            st.error(f"Error loading history: {e}")
+
 # Upload data
 st.markdown('<h2 class="section-header">Data Upload</h2>', unsafe_allow_html=True)
-uploaded_file = st.file_uploader("Select Excel file", type=["xlsx", "xls"])
+
+uploaded_file = st.file_uploader(
+    "Drag and drop file here",
+    type=["xlsx", "xls", "csv"],
+    help="Limit 200MB per file • XLSX, XLS, CSV"
+)
+
+# Handle analysis restoration from history
+if st.session_state.get('restore_analysis_id'):
+    try:
+        from src.history_manager import get_analysis_by_id
+        import json
+        
+        analysis = get_analysis_by_id(st.session_state.restore_analysis_id)
+        if analysis:
+            st.info(f"🔄 Restoring analysis from {analysis['created_at'].strftime('%Y-%m-%d %H:%M')}")
+            
+            # Load the dataset
+            from src.data_processor import fetch_dataframe_from_db
+            df = fetch_dataframe_from_db(f'SELECT * FROM "{analysis["table_name"]}"')
+            
+            if df is not None and not df.empty:
+                # Restore session state
+                st.session_state.parsed_df = df.copy()
+                st.session_state.original_df = df.copy()
+                st.session_state.table_name = analysis['table_name']
+                
+                # Parse config
+                config = analysis['config_json']
+                if isinstance(config, str):
+                    config = json.loads(config)
+                
+                # Store restored config in session
+                st.session_state.restored_config = config
+                
+                st.success(f"✅ Restored analysis for '{analysis['original_filename']}'")
+                st.info("Configuration has been restored. Scroll down to review and re-run the analysis.")
+            else:
+                st.error("Failed to load dataset. The data may have been deleted.")
+        
+        # Clear restore flag
+        st.session_state.restore_analysis_id = None
+    except Exception as e:
+        st.error(f"Error restoring analysis: {e}")
+        st.session_state.restore_analysis_id = None
 
 if uploaded_file:
-    # Initialize session state for date parsing
+    # Initialize session state for date parsing and database
     if 'parsed_df' not in st.session_state:
         st.session_state.parsed_df = None
     if 'date_columns_config' not in st.session_state:
         st.session_state.date_columns_config = {}
+    if 'table_name' not in st.session_state:
+        st.session_state.table_name = None
     
-    # Load initial data
+    # Load initial data and save to database
     if st.session_state.parsed_df is None:
-        df = load_and_process_data(uploaded_file)
-        st.session_state.original_df = df.copy()
-        st.session_state.parsed_df = df.copy()
+        with st.spinner("🚀 Uploading data using optimized method..."):
+            progress_bar = st.progress(0)
+            status_text = st.empty()
+            
+            status_text.text("Reading Excel file...")
+            progress_bar.progress(20)
+            
+            df, table_name = load_and_process_data(uploaded_file, save_to_db=True)
+            
+            progress_bar.progress(90)
+            status_text.text("Finalizing...")
+            
+            st.session_state.original_df = df.copy()
+            st.session_state.parsed_df = df.copy()
+            st.session_state.table_name = table_name
+            
+            progress_bar.progress(100)
+            status_text.empty()
+            progress_bar.empty()
+            
+            if table_name:
+                st.success(f"✅ Data uploaded successfully! {len(df):,} rows loaded to table: `{table_name}`")
+                st.info(f"⚡ Upload completed using PostgreSQL COPY (optimized for large files)")
     else:
         df = st.session_state.parsed_df.copy()
+        table_name = st.session_state.table_name
     
     st.success(f"Successfully loaded {len(df)} rows and {len(df.columns)} columns")
     
@@ -461,11 +640,31 @@ if uploaded_file:
     
     if configure_dates:
         with st.expander("Date Column Configuration", expanded=True):
-            # Select date column
-            date_column = st.selectbox(
-                "Select the date column to configure",
-                options=[None] + df.columns.tolist()
-            )
+            # Filter out numeric columns - only show text/object columns that could be dates
+            def is_likely_date_column(col):
+                """Check if column is likely to contain dates (not numeric data)"""
+                if pd.api.types.is_numeric_dtype(df[col]):
+                    return False
+                # Check if column contains mostly numeric-like values
+                sample = df[col].dropna().head(100)
+                if len(sample) == 0:
+                    return False
+                # Try converting to numeric - if most values can be converted, it's numeric data
+                numeric_count = pd.to_numeric(sample, errors='coerce').notna().sum()
+                if numeric_count / len(sample) > 0.7:  # More than 70% are numeric
+                    return False
+                return True
+            
+            non_numeric_columns = [col for col in df.columns if is_likely_date_column(col)]
+            
+            if not non_numeric_columns:
+                st.warning("No text columns found. Date columns should contain text like '2024-01-15', not numbers.")
+            else:
+                # Select date column
+                date_column = st.selectbox(
+                    "Select the date column to configure (numeric and numeric-like columns excluded)",
+                    options=[None] + non_numeric_columns
+                )
             
             if date_column:
                 # Show sample data
@@ -498,24 +697,42 @@ if uploaded_file:
                             if success:
                                 st.success("Multi-format parsing successful!")
                                 st.text(message)
+                            else:
+                                st.error("Parsing failed or success rate too low")
+                                st.text(message)
                                 
-                                # Show before/after comparison
-                                col1, col2 = st.columns(2)
-                                with col1:
-                                    st.write("**Original Values (first 10):**")
-                                    original_sample = df[date_column].head(10)
-                                    for i, val in enumerate(original_sample):
-                                        st.write(f"{i+1}. {val}")
-                                with col2:
-                                    st.write("**Parsed Values (first 10):**")
-                                    parsed_sample = test_df[date_column].head(10)
-                                    for i, val in enumerate(parsed_sample):
-                                        if pd.notna(val):
-                                            st.write(f"{i+1}. {val.strftime('%Y-%m-%d %H:%M:%S')}")
-                                        else:
-                                            st.write(f"{i+1}. Failed to parse")
+                            # Show before/after comparison (regardless of success/failure)
+                            st.write("**Parsing Results (first 10 non-null values):**")
+                            
+                            # Get first 10 non-null original values
+                            original_non_null = df[date_column].dropna().head(10)
+                            
+                            if len(original_non_null) > 0:
+                                # Create a comparison table
+                                comparison_data = []
+                                for idx in original_non_null.index:
+                                    original_val = df.loc[idx, date_column]
+                                    parsed_val = test_df.loc[idx, date_column]
+                                    
+                                    if pd.notna(parsed_val):
+                                        parsed_str = parsed_val.strftime('%Y-%m-%d %H:%M:%S')
+                                        status = "✓ Success"
+                                    else:
+                                        parsed_str = "Failed to parse"
+                                        status = "✗ Failed"
+                                    
+                                    comparison_data.append({
+                                        'Original': str(original_val),
+                                        'Parsed': parsed_str,
+                                        'Status': status
+                                    })
                                 
-                                # Store test result
+                                st.table(comparison_data)
+                            else:
+                                st.warning("No non-null values found in the column")
+                                
+                            # Store test result if parsing was somewhat successful
+                            if success:
                                 st.session_state.test_result = {
                                     'column': date_column,
                                     'formats': selected_formats,
@@ -524,9 +741,7 @@ if uploaded_file:
                                     'message': message,
                                     'type': 'multi_format'
                                 }
-                                
                             else:
-                                st.error(message)
                                 if 'test_result' in st.session_state:
                                     del st.session_state.test_result
                 
@@ -567,14 +782,34 @@ if uploaded_file:
                                 st.success(message)
                                 
                                 # Show before/after comparison
-                                col1, col2 = st.columns(2)
-                                with col1:
-                                    st.write("**Original Values (first 5):**")
-                                    st.write(df[date_column].head(5).tolist())
-                                with col2:
-                                    st.write("**Parsed Values (first 5):**")
-                                    parsed_values = test_df[date_column].head(5)
-                                    st.write([d.strftime('%Y-%m-%d %H:%M:%S') if pd.notna(d) else 'Failed to parse' for d in parsed_values])
+                                st.write("**Parsing Results (first 10 non-null values):**")
+                                
+                                # Get first 10 non-null original values
+                                original_non_null = df[date_column].dropna().head(10)
+                                
+                                if len(original_non_null) > 0:
+                                    # Create a comparison table
+                                    comparison_data = []
+                                    for idx in original_non_null.index:
+                                        original_val = df.loc[idx, date_column]
+                                        parsed_val = test_df.loc[idx, date_column]
+                                        
+                                        if pd.notna(parsed_val):
+                                            parsed_str = parsed_val.strftime('%Y-%m-%d %H:%M:%S')
+                                            status = "✓ Success"
+                                        else:
+                                            parsed_str = "Failed to parse"
+                                            status = "✗ Failed"
+                                        
+                                        comparison_data.append({
+                                            'Original': str(original_val),
+                                            'Parsed': parsed_str,
+                                            'Status': status
+                                        })
+                                    
+                                    st.table(comparison_data)
+                                else:
+                                    st.warning("No non-null values found in the column")
                                 
                                 st.session_state.test_result = {
                                     'column': date_column,
@@ -631,23 +866,42 @@ if uploaded_file:
                                 if success:
                                     st.success("Multi-format parsing successful!")
                                     st.text(message)
+                                else:
+                                    st.error("Parsing failed or success rate too low")
+                                    st.text(message)
                                     
-                                    # Show before/after comparison
-                                    col1, col2 = st.columns(2)
-                                    with col1:
-                                        st.write("**Original Values (first 10):**")
-                                        original_sample = df[date_column].head(10)
-                                        for i, val in enumerate(original_sample):
-                                            st.write(f"{i+1}. {val}")
-                                    with col2:
-                                        st.write("**Parsed Values (first 10):**")
-                                        parsed_sample = test_df[date_column].head(10)
-                                        for i, val in enumerate(parsed_sample):
-                                            if pd.notna(val):
-                                                st.write(f"{i+1}. {val.strftime('%Y-%m-%d %H:%M:%S')}")
-                                            else:
-                                                st.write(f"{i+1}. Failed to parse")
+                                # Show before/after comparison (regardless of success/failure)
+                                st.write("**Parsing Results (first 10 non-null values):**")
+                                
+                                # Get first 10 non-null original values
+                                original_non_null = df[date_column].dropna().head(10)
+                                
+                                if len(original_non_null) > 0:
+                                    # Create a comparison table
+                                    comparison_data = []
+                                    for idx in original_non_null.index:
+                                        original_val = df.loc[idx, date_column]
+                                        parsed_val = test_df.loc[idx, date_column]
+                                        
+                                        if pd.notna(parsed_val):
+                                            parsed_str = parsed_val.strftime('%Y-%m-%d %H:%M:%S')
+                                            status = "✓ Success"
+                                        else:
+                                            parsed_str = "Failed to parse"
+                                            status = "✗ Failed"
+                                        
+                                        comparison_data.append({
+                                            'Original': str(original_val),
+                                            'Parsed': parsed_str,
+                                            'Status': status
+                                        })
                                     
+                                    st.table(comparison_data)
+                                else:
+                                    st.warning("No non-null values found in the column")
+                                    
+                                # Store test result if parsing was somewhat successful
+                                if success:
                                     st.session_state.test_result = {
                                         'column': date_column,
                                         'formats': selected_formats,
@@ -656,9 +910,7 @@ if uploaded_file:
                                         'message': message,
                                         'type': 'multi_format'
                                     }
-                                    
                                 else:
-                                    st.error(message)
                                     if 'test_result' in st.session_state:
                                         del st.session_state.test_result
                 
@@ -735,7 +987,16 @@ if uploaded_file:
                 st.write("None detected")
     
     columns = df.columns.tolist()
-    selected_columns = st.multiselect("Select columns for analysis", columns)
+    
+    # Check if we have restored config to pre-populate
+    restored_config = st.session_state.get('restored_config', {})
+    default_selected = restored_config.get('selected_columns', []) if restored_config else []
+    
+    selected_columns = st.multiselect(
+        "Select columns for analysis", 
+        columns,
+        default=default_selected if default_selected else None
+    )
 
     if selected_columns:
         st.markdown('<h2 class="section-header">Statistical Analysis & Threshold Configuration</h2>', unsafe_allow_html=True)
@@ -1098,11 +1359,19 @@ if uploaded_file:
                         st.info(f"Threshold value: {threshold_value:.2f}")
                         thresholds[col] = {"type": "median", "value": threshold_value}
                     elif threshold_type == "Custom":
+                        # Round values to avoid floating-point precision errors
+                        min_val = float(col_data.min())
+                        max_val = float(col_data.max())
+                        mean_val = float(col_data.mean())
+                        
+                        # Ensure mean is within bounds (handle floating-point precision)
+                        mean_val = max(min_val, min(mean_val, max_val))
+                        
                         threshold_value = st.number_input(
                             f"Custom threshold for {col}",
-                            min_value=float(col_data.min()),
-                            max_value=float(col_data.max()),
-                            value=float(col_data.mean()),
+                            min_value=min_val,
+                            max_value=max_val,
+                            value=mean_val,
                             key=f"custom_threshold_{col}"
                         )
                         st.info(f"Threshold value: {threshold_value:.2f}")
@@ -1134,11 +1403,19 @@ if uploaded_file:
                                 )
                             
                             with col2:
+                                # Round values to avoid floating-point precision errors
+                                min_val = float(col_data.min())
+                                max_val = float(col_data.max())
+                                mean_val = float(col_data.mean())
+                                
+                                # Ensure mean is within bounds (handle floating-point precision)
+                                mean_val = max(min_val, min(mean_val, max_val))
+                                
                                 value = st.number_input(
                                     f"Value",
-                                    min_value=float(col_data.min()),
-                                    max_value=float(col_data.max()),
-                                    value=float(col_data.mean()),
+                                    min_value=min_val,
+                                    max_value=max_val,
+                                    value=mean_val,
                                     key=f"condition_value_{col}_{i}"
                                 )
                             
@@ -1311,10 +1588,13 @@ if uploaded_file:
             result_columns = numeric_columns
             st.info(f"Selected all {len(numeric_columns)} numeric columns for analysis")
         else:
+            # Check if we have restored config
+            default_result_cols = restored_config.get('result_columns', []) if restored_config else []
+            
             result_columns = st.multiselect(
                 "Select columns for statistical calculations", 
                 numeric_columns,
-                default=[]
+                default=default_result_cols if default_result_cols else []
             )
 
         # Step 5: Run analysis
@@ -1360,13 +1640,18 @@ if uploaded_file:
 
         # Add this after the result columns selection and before the analyze button
         st.subheader("Analysis Settings")
+        
+        # Calculate reasonable max based on dataset size
+        max_threshold = max(100, len(df) // 2)  # Allow up to half the dataset size
+        default_threshold = min(10, len(df) // 100)  # Default: 1% of data or 10, whichever is smaller
+        
         min_matching_rows = st.number_input(
             "Minimum Matching Rows Threshold",
             min_value=1,
-            max_value=1000,
-            value=10,
+            max_value=max_threshold,
+            value=default_threshold,
             step=1,
-            help="Filter out combinations with fewer than this many matching rows to focus on statistically relevant results"
+            help=f"Filter out combinations with fewer than this many matching rows (max: {max_threshold:,} based on your dataset size of {len(df):,} rows)"
         )
         
         if st.button("Analyze Data Combinations", type="primary"):
@@ -1374,30 +1659,137 @@ if uploaded_file:
                 st.error("Please select at least one column for analysis")
             elif not result_columns:
                 st.error("Please select at least one result column")
+            elif not st.session_state.table_name:
+                st.error("Data not saved to database. Please reload the file.")
             else:
-                with st.spinner("Analyzing data combinations..."):
-                    try:
-                        # Pass the min_matching_rows parameter to the analysis function
-                        results = analyze_data_combinations(
-                            df, 
-                            selected_columns, 
-                            thresholds, 
-                            id_column, 
-                            result_columns,
-                            min_matching_rows=min_matching_rows
-                        )
+                # Build config for caching check
+                from src.history_manager import generate_config_hash, find_cached_analysis
+                
+                analysis_config = {
+                    'selected_columns': selected_columns,
+                    'thresholds': thresholds,
+                    'id_column': id_column,
+                    'result_columns': result_columns,
+                    'min_matching_rows': min_matching_rows
+                }
+                
+                # Check if we have cached results
+                dataset_id = df.attrs.get('dataset_id')
+                cached_result = None
+                
+                if dataset_id:
+                    config_hash = generate_config_hash(analysis_config)
+                    cached_result = find_cached_analysis(dataset_id, config_hash)
+                
+                if cached_result:
+                    # Use cached results!
+                    st.info("⚡ Found cached results! Loading instantly...")
+                    
+                    result_preview = cached_result.get('result_preview')
+                    if result_preview:
+                        import json
+                        if isinstance(result_preview, str):
+                            result_preview = json.loads(result_preview)
                         
-                        st.markdown('<h3 style="color: #374151;">Result of Analysis</h3>', unsafe_allow_html=True)
+                        # Reconstruct DataFrame from preview
+                        results = pd.DataFrame(result_preview['data'])
+                        
+                        exec_time = cached_result.get('execution_time_ms', 0)
+                        result_count = cached_result.get('result_row_count', len(results))
+                        
+                        st.markdown('<h3 style="color: #374151;">Result of Analysis (Cached)</h3>', unsafe_allow_html=True)
+                        st.success(f"✅ Loaded {result_count} results from cache (original execution: {exec_time}ms)")
                         st.dataframe(results)
-
-                        # Step 6: Download results
+                        
+                        # Download button
                         if not results.empty:
                             if st.button("Download Results", type="secondary"):
                                 export_results(results)
                                 st.success("Results exported successfully")
-                        else:
-                            st.warning("No combinations produced results")
-                    except Exception as e:
-                        st.error(f"Error during analysis: {str(e)}")
+                    else:
+                        st.warning("Cached result found but no preview available. Re-running analysis...")
+                        cached_result = None
+                
+                if not cached_result:
+                    # Run fresh analysis
+                    with st.spinner("Analyzing data combinations using database queries..."):
+                        try:
+                            import time
+                            start_time = time.time()
+                            
+                            # Determine column types for SQL generation
+                            column_types = {}
+                            for col in selected_columns:
+                                if is_date_column(df, col) or (col in st.session_state.date_columns_config and 
+                                                               st.session_state.date_columns_config[col].get('applied', False)):
+                                    column_types[col] = 'date'
+                                elif pd.api.types.is_numeric_dtype(df[col]):
+                                    column_types[col] = 'numeric'
+                                else:
+                                    column_types[col] = 'categorical'
+                        
+                            # Import the database-driven analysis function
+                            from analysis_engine import analyze_data_combinations_db
+                            
+                            # Use database-driven analysis for better performance
+                            results = analyze_data_combinations_db(
+                                st.session_state.table_name,
+                                selected_columns, 
+                                thresholds, 
+                                id_column, 
+                                result_columns,
+                                column_types,
+                                min_matching_rows=min_matching_rows
+                            )
+                            
+                            execution_time_ms = int((time.time() - start_time) * 1000)
+                            
+                            # Save analysis to history
+                            try:
+                                from src.history_manager import save_analysis
+                                
+                                # Update config with column_types
+                                analysis_config['column_types'] = column_types
+                                
+                                # Create result preview (first 100 rows)
+                                result_preview = None
+                                if not results.empty:
+                                    preview_df = results.head(100)
+                                    result_preview = {
+                                        'columns': list(preview_df.columns),
+                                        'data': preview_df.to_dict(orient='records')
+                                    }
+                                
+                                # Get dataset_id from session
+                                dataset_id = df.attrs.get('dataset_id')
+                                
+                                if dataset_id:
+                                    # Save analysis
+                                    analysis_id = save_analysis(
+                                        dataset_id=dataset_id,
+                                        config=analysis_config,
+                                        status='completed',
+                                        execution_time_ms=execution_time_ms,
+                                        result_preview=result_preview,
+                                        result_row_count=len(results)
+                                    )
+                                    if analysis_id:
+                                        print(f"Analysis saved to history with ID: {analysis_id}")
+                            except Exception as e:
+                                print(f"Warning: Failed to save analysis to history: {e}")
+                            
+                            st.markdown('<h3 style="color: #374151;">Result of Analysis</h3>', unsafe_allow_html=True)
+                            st.success(f"✅ Analysis complete! Found {len(results)} combinations in {execution_time_ms}ms using database queries")
+                            st.dataframe(results)
+
+                            # Step 6: Download results
+                            if not results.empty:
+                                if st.button("Download Results", type="secondary"):
+                                    export_results(results)
+                                    st.success("Results exported successfully")
+                            else:
+                                st.warning("No combinations produced results")
+                        except Exception as e:
+                            st.error(f"Error during analysis: {str(e)}")
         else:
             st.info("Adjust settings and click 'Run Analysis' to view results")
